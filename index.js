@@ -135,6 +135,21 @@ function apply(ctx, config) {
   }
 
   // ---- 重启执行 ----
+  // 关键：spawn 失败（含异步 error 事件）时【不退出本进程】——旧版本会 exit(1) 自杀，
+  // 导致 web 挂掉、用户被迫手动重启。失败时复位状态并保留登记。
+  const fs = require('node:fs')
+  const path = require('node:path')
+  const os = require('node:os')
+  const stateFile = path.join(
+    process.env.DSH_HOME || path.join(os.homedir(), '.dsh'),
+    'dsh-restart-guard-state.json',
+  )
+  const writeState = (obj) => {
+    try {
+      fs.mkdirSync(path.dirname(stateFile), { recursive: true })
+      fs.writeFileSync(stateFile, JSON.stringify(obj, null, 2))
+    } catch {}
+  }
   const executeRestart = () => {
     if (state === 'restarting') return
     state = 'restarting'
@@ -145,28 +160,55 @@ function apply(ctx, config) {
     pending.clear()
     history.push({ at: Date.now(), reasons })
     if (history.length > 50) history.shift()
+    // 重启证据持久化：新进程（或用户手动重启后）可查上次自动重启是否执行
+    writeState({ last: { at: Date.now(), reasons, via: 'auto', stage: 'spawning' } })
     if (!cfg.autoRestart) {
       state = 'idle'
       return
     }
-    // 以相同启动参数派生新进程（execArgv 保留 tsx 等 loader 参数）
+    // 以相同启动参数派生新进程（execArgv 保留 tsx 等 loader 参数）。
+    // 子进程输出重定向到 .child.log 文件（fd 重定向：父进程退出后 fd 仍有效），
+    // 新进程启动失败/崩溃的原因可以事后读取。
     const args = [...(process.execArgv || []), ...(process.argv || []).slice(1)]
-    let spawned = false
+    let child = null
+    let spawnError = null
+    let logFd = null
+    try {
+      logFd = fs.openSync(stateFile.replace(/\.json$/, '.child.log'), 'a')
+    } catch {}
     try {
       const { spawn } = require('node:child_process')
-      const child = spawn(process.execPath, args, {
+      child = spawn(process.execPath, args, {
         cwd: process.cwd(),
         detached: true,
-        stdio: 'inherit',
+        stdio: logFd !== null ? ['ignore', logFd, logFd] : 'ignore',
         windowsHide: false,
       })
+      child.on('error', (err) => {
+        spawnError = String(err)
+        writeState({ last: { at: Date.now(), reasons, via: 'auto', stage: 'spawn-error', spawnError } })
+      })
+      child.on('exit', (code, sig) => {
+        // 新进程退出了（很可能启动失败）——记录，且本进程保持运行
+        writeState({ last: { at: Date.now(), reasons, via: 'auto', stage: 'child-exited', code, sig } })
+      })
       child.unref()
-      spawned = true
-    } catch {}
-    // 给新进程窗口，再退出本进程
+    } catch (err) {
+      spawnError = String(err)
+      writeState({ last: { at: Date.now(), reasons, via: 'auto', stage: 'spawn-threw', spawnError } })
+    }
+    if (child === null) {
+      state = 'idle'
+      return
+    }
+    // 给新进程窗口；新进程已退出或 spawn 失败则保持运行（不自杀），复位状态
     ctx.timeout(() => {
+      if (spawnError !== null || child.exitCode !== null || child.signalCode !== null) {
+        state = 'idle'
+        return
+      }
       try {
-        process.exit(spawned ? 0 : 1)
+        process.exit(0)
       } catch {}
     }, cfg.exitDelayMs)
   }
@@ -233,19 +275,26 @@ function apply(ctx, config) {
     }
     return false
   }
-  const status = () => ({
-    state,
-    pending: [...pending.entries()].map(([id, p]) => ({ id, ...p })),
-    history: history.slice(-10),
-    config: { ...cfg },
-    hotReloadInstalled,
-    hotUpdateHints: {
-      clientBundle: '改 client 代码 → 刷新浏览器即生效',
-      profilePatch: '改 cordis.patch.yml → HMR 热重载',
-      dynamicPlugin: '实验性 host 代码 → 用动态插件避免重启',
-      pluginUpgrade: hotReloadInstalled ? '已装 dsh-hot-reload → 插件升级自动热重载' : '插件升级需重启（安装 dsh-hot-reload 可免）',
-    },
-  })
+  const status = () => {
+    let lastRestart = null
+    try {
+      lastRestart = JSON.parse(fs.readFileSync(stateFile, 'utf8')).last ?? null
+    } catch {}
+    return {
+      state,
+      pending: [...pending.entries()].map(([id, p]) => ({ id, ...p })),
+      history: history.slice(-10),
+      lastRestart,
+      config: { ...cfg },
+      hotReloadInstalled,
+      hotUpdateHints: {
+        clientBundle: '改 client 代码 → 刷新浏览器即生效',
+        profilePatch: '改 cordis.patch.yml → HMR 热重载',
+        dynamicPlugin: '实验性 host 代码 → 用动态插件避免重启',
+        pluginUpgrade: hotReloadInstalled ? '已装 dsh-hot-reload → 插件升级自动热重载' : '插件升级需重启（安装 dsh-hot-reload 可免）',
+      },
+    }
+  }
   const restartNow = (reason) => {
     request(reason || 'manual restartNow', { kind: 'forced' })
     // 强制：跳过合并与空闲等待
