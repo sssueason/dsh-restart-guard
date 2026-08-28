@@ -1,7 +1,7 @@
 {
   "name": "dsh-restart-guard",
   "description": "DSH 重启管理（整合 dsh-hot-reload）：非必要不重启——插件升级自动热重载（watch pnpm-lock.yaml），热重载失败与新增/移除插件等残余重启由守卫聚批、空闲后自动执行（复刻 dsh-app.ps1 启动链）；改动分类 + /restart/* HTTP API。",
-  "version": "1.0.0",
+  "version": "1.0.3",
   "type": "module",
   "main": "index.js",
   "exports": {
@@ -23,7 +23,14 @@
     "chokidar": "^4.0.3"
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis": "^4.0.1"
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/cordis-plugin-loader": "*"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis-plugin-loader": {
+      "optional": true,
+      "description": "提供 loader.internal（热重载引擎所需）；缺失时引擎降级为「提示重启」，守卫功能不受影响"
+    }
   },
   "license": "MIT",
   "keywords": [

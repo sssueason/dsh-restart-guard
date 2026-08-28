@@ -336,7 +336,7 @@ export function apply(ctx, config) {
       kind: 'exact', path: '/restart/classify',
       handler: (req, res) => {
         const url = new URL(req.url ?? '/', 'http://x')
-        sendJson(res, 200, { path: url.searchParams.get('path') || '', ...classifyPath(url.searchParams.get('path') || '') })
+        sendJson(res, 200, { path: url.searchParams.get('path') || '', ...classify(url.searchParams.get('path') || '') })
       },
     }))
     uiRegistered = true
