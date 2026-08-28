@@ -42,6 +42,20 @@ idle ──request()──▶ waiting-merge ──窗口到──▶ waiting-idl
                      idle ◀──────────────────── idle（保留登记）
 ```
 
+## 与 dsh-hot-reload 协作
+
+[`dsh-hot-reload`](https://github.com/stuarthu/dsh-hot-reload) 把**已装插件包的升级**变成热重载（监听 `pnpm-lock.yaml`，loader 内部缓存失效 + fiber 原地重建，失败回滚）。两者互补、可同时安装：
+
+| 改动类型 | 处理者 |
+|---|---|
+| client bundle 源码 | 原生热更新（刷新浏览器） |
+| `cordis.patch.yml` | 原生 HMR 热重载 |
+| 插件包**升级**（已加载） | `dsh-hot-reload` 热重载（失败则回滚并提示重启） |
+| 插件**新增 / 移除**、host 代码、`cordis.yml` | `dsh-restart-guard` 聚批 + 空闲自动重启 |
+
+- 本插件启动时自动检测 `dsh-hot-reload` 是否活跃：`/restart/status` 的 `hotReloadInstalled` 字段与 `classify()` 提示会随之变化（升级类从「需重启」变为「可热重载」）
+- `dsh-hot-reload` 失败回滚后需要重启捡新代码——可调用 `restartGuard.request('hot-reload 升级失败，需重启')` 交给守卫编排
+
 ## 安装
 
 ```sh

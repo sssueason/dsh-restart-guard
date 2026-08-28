@@ -36,7 +36,7 @@ const DEFAULTS = {
 }
 
 // ---- 改动分类表（非必要不重启） ----
-function classifyPath(p) {
+function classifyPath(p, hotReloadInstalled = false) {
   const path = String(p || '').replace(/\\/g, '/')
   const lower = path.toLowerCase()
   const base = lower.split('/').pop() || ''
@@ -50,7 +50,14 @@ function classifyPath(p) {
     return { restart: false, kind: 'hot-patch', hint: 'profile patch 由 HMR watcher 热重载——写入即生效，无需重启' }
   }
   if (base === 'package.json' || lower.includes('node_modules')) {
-    return { restart: true, kind: 'plugin-set', hint: '插件集合变更由 loader 元数据缓存管理——需要重启' }
+    return {
+      restart: true,
+      kind: 'plugin-set',
+      // 若已装 dsh-hot-reload：已加载包的「升级」可热重载；新增/移除仍需重启
+      hint: hotReloadInstalled
+        ? '插件升级可被 dsh-hot-reload 热重载；新增/移除插件包仍需要重启'
+        : '插件集合变更由 loader 元数据缓存管理——需要重启（安装 dsh-hot-reload 可使升级免重启）',
+    }
   }
   if (base === 'cordis.yml' || lower.endsWith('cordis.yml')) {
     return { restart: true, kind: 'composition', hint: '组成文件在 boot 解析——需要重启' }
@@ -70,6 +77,15 @@ function apply(ctx, config) {
       if (configured[key] !== undefined) cfg[key] = configured[key]
     }
   }
+
+  // ---- 检测 dsh-hot-reload 是否活跃（升级类改动的热重载能力） ----
+  let hotReloadInstalled = false
+  try {
+    const loader = ctx.get('loader')
+    const entries = loader && typeof loader.entries === 'function' ? loader.entries() : []
+    hotReloadInstalled = entries.some((e) => (e.name || '').includes('dsh-hot-reload') || (e.id || '') === 'hot-reload')
+  } catch {}
+  const classify = (p) => classifyPath(p, hotReloadInstalled)
 
   /** id -> { reason, kind, requester, createdAt } */
   const pending = new Map()
@@ -197,10 +213,12 @@ function apply(ctx, config) {
     pending: [...pending.entries()].map(([id, p]) => ({ id, ...p })),
     history: history.slice(-10),
     config: { ...cfg },
+    hotReloadInstalled,
     hotUpdateHints: {
       clientBundle: '改 client 代码 → 刷新浏览器即生效',
       profilePatch: '改 cordis.patch.yml → HMR 热重载',
       dynamicPlugin: '实验性 host 代码 → 用动态插件避免重启',
+      pluginUpgrade: hotReloadInstalled ? '已装 dsh-hot-reload → 插件升级自动热重载' : '插件升级需重启（安装 dsh-hot-reload 可免）',
     },
   })
   const restartNow = (reason) => {
@@ -215,7 +233,7 @@ function apply(ctx, config) {
   }
 
   // ---- service ----
-  ctx.provide('restartGuard', { request, cancel, status, classify: classifyPath, restartNow })
+  ctx.provide('restartGuard', { request, cancel, status, classify, restartNow })
 
   // ---- HTTP routes（webServer 可选） ----
   const readBody = (req) => new Promise((resolve) => {
