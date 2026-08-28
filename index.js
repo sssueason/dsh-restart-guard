@@ -75,6 +75,7 @@ export function apply(ctx, config) {
   }
 
   // ---- 状态 ----
+  console.log('[restart-guard] apply start')
   /** id -> { reason, kind, requester, createdAt, force } */
   const pending = new Map()
   /** { at, reasons[] } */
@@ -111,9 +112,9 @@ export function apply(ctx, config) {
   const executeRestart = () => {
     if (state === 'restarting') return
     state = 'restarting'
-    if (mergeTimer) { mergeTimer.stop(); mergeTimer = null }
-    if (idleTimer) { idleTimer.stop(); idleTimer = null }
-    if (idlePoll) { idlePoll.stop(); idlePoll = null }
+    if (mergeTimer) { mergeTimer(); mergeTimer = null }
+    if (idleTimer) { idleTimer(); idleTimer = null }
+    if (idlePoll) { idlePoll(); idlePoll = null }
     const reasons = [...pending.values()].map((p) => p.reason)
     pending.clear()
     history.push({ at: Date.now(), reasons })
@@ -170,8 +171,8 @@ export function apply(ctx, config) {
   // ---- 状态机 ----
   const hasForce = () => [...pending.values()].some((p) => p.force === true)
   const stopIdleWait = () => {
-    if (idleTimer) { idleTimer.stop(); idleTimer = null }
-    if (idlePoll) { idlePoll.stop(); idlePoll = null }
+    if (idleTimer) { idleTimer(); idleTimer = null }
+    if (idlePoll) { idlePoll(); idlePoll = null }
   }
   const startIdleWait = () => {
     state = 'waiting-idle'
@@ -220,14 +221,14 @@ export function apply(ctx, config) {
     if (id !== undefined) {
       const removed = pending.delete(id)
       if (removed && pending.size === 0 && state === 'waiting-merge') {
-        if (mergeTimer) { mergeTimer.stop(); mergeTimer = null }
+        if (mergeTimer) { mergeTimer(); mergeTimer = null }
         state = 'idle'
       }
       return removed
     }
     if (state === 'waiting-merge') {
       pending.clear()
-      if (mergeTimer) { mergeTimer.stop(); mergeTimer = null }
+      if (mergeTimer) { mergeTimer(); mergeTimer = null }
       state = 'idle'
       return true
     }
@@ -262,7 +263,7 @@ export function apply(ctx, config) {
   }
   const restartNow = (reason) => {
     request(reason || 'manual restartNow', { kind: 'forced', force: true })
-    if (mergeTimer) { mergeTimer.stop(); mergeTimer = null }
+    if (mergeTimer) { mergeTimer(); mergeTimer = null }
     startIdleWait()
     stopIdleWait()
     executeRestart()
@@ -276,6 +277,7 @@ export function apply(ctx, config) {
       request(`热重载失败 ${pkg}@${version}，需要重启`, { kind: 'reload-failed' })
     },
   })
+  console.log('[restart-guard] reloader active:', reloader !== null)
   const classify = (p) => classifyPath(p, reloader !== null)
 
   // ---- service ----
@@ -346,9 +348,9 @@ export function apply(ctx, config) {
       webServer = ctx.get('webServer')
       if (webServer !== undefined) {
         registerRoutes(webServer)
-        probe.stop()
+        probe()
       } else if (++tries >= 15) {
-        probe.stop()
+        probe()
       }
     }, 2000)
   }
