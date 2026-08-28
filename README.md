@@ -1,6 +1,6 @@
 # dsh-restart-guard
 
-DSH 重启管理（v1.0，**整合 dsh-hot-reload**）：**非必要不重启，最小化热更新**。插件升级自动热重载，热重载失败与残余重启由守卫聚批、空闲后自动执行。
+DSH 重启管理（v1.0.4，**整合 dsh-hot-reload**）：**非必要不重启，最小化热更新**。插件升级自动热重载，热重载失败与残余重启由守卫聚批、空闲后自动执行。
 
 ## 重启决策树
 
@@ -25,10 +25,12 @@ DSH 重启管理（v1.0，**整合 dsh-hot-reload**）：**非必要不重启，
   - `request(reason, {kind, force})` 登记；合并窗口（默认 60s）聚批为一次重启
   - **force 模式**：`{force:true}` → 合并窗口 5s、空闲轮询 1s、**无超时**——当前回合结束后立即重启（不打断回合）
   - 空闲检测（`agents` 服务 status）；非 force 超时后 15s 重试（防饿死）
-  - **自动重启复刻 dsh-app.ps1 启动链**（`cmd /c pnpm dsh web > dsh-web.log 2>&1`，cwd=DeepSeek-Harness）——与手动启动完全一致
+  - **自动重启 = node 直启**：`spawn(process.execPath, [...process.execArgv, ...process.argv.slice(1)], { cwd: process.cwd(), detached: true, stdio: ['ignore', logFd, logFd], windowsHide: true })`（cwd=DeepSeek-Harness，与手动启动等效）
+    - **1.0.2**：去掉 `> dsh-web.log` 重定向——旧进程 cmd 持有该文件句柄，新进程打开失败退出 code 1；子进程日志改走 child.log
+    - **1.0.4**：弃用 `cmd /c pnpm dsh web` 链，改 node 直启 + `windowsHide:true`——消除 pnpm→node 子链弹出的 Node.js 控制台窗口
   - **双保险**：spawn 失败 / 新进程已退出 → 旧进程**保持运行**（不自杀）+ state 记录 stage
   - 子进程输出重定向 `dsh-restart-guard-state.child.log`（fd 重定向，父退出后仍可读）——失败原因可查
-- **改动分类**：`classify(path)` 判断热更新 vs 必须重启
+- **改动分类**：`classify(path)` 判断热更新 vs 必须重启（1.0.3：HTTP 路由改用带引擎状态的闭包，提示与实际热重载能力一致）
 - **HTTP API**（webServer 探测注册；无 webServer 的 profile 不挂起）：
   - `GET /restart/status` — 状态、待重启、历史、`lastRestart`（重启证据）、引擎状态
   - `POST /restart/request` — `{ reason, kind, force }`
@@ -95,4 +97,7 @@ guard.request('部署 1.2.0', { kind: 'deploy', force: true })
 
 // 引擎激活状态：
 { "reloadEngine": { "active": true, "watching": true, "tracked": 164, "failedVersions": {} } }
+
+// 自动重启回归（1.0.2–1.0.4）：via:auto 启动成功、无控制台弹窗、child.log 无文件锁错误；
+// 1.0.4 后 dsh-web.log 不再被新进程写入（日志走 child.log）
 ```
