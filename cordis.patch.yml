@@ -1,0 +1,7 @@
+# dsh-restart-guard bundle patch —— 重启守卫（常开）。
+# 非必要不重启：合并窗口聚批待重启原因，会话空闲后自动重启；
+# /restart/status|request|cancel|now|classify HTTP API 供 UI/工具编排。
+- insert:
+    - id: restart-guard
+      name: 'dsh-restart-guard'
+      inject: [timer, webServer]

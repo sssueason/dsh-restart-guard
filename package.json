@@ -1,0 +1,33 @@
+{
+  "name": "dsh-restart-guard",
+  "description": "重启守卫：管理 DSH 的重启行为——非必要不重启，最小化热更新。登记「待重启」原因并按合并窗口聚批；等会话空闲后自动重启（可选）；提供改动分类判断（哪些改动可热更新、哪些真需重启）与 /restart/* HTTP API。",
+  "version": "0.1.0",
+  "type": "commonjs",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1"
+  },
+  "license": "MIT",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "restart",
+    "hot-reload",
+    "reload",
+    "uptime"
+  ]
+}
