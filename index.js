@@ -83,8 +83,21 @@ function apply(ctx, config) {
   try {
     const loader = ctx.get('loader')
     const entries = loader && typeof loader.entries === 'function' ? loader.entries() : []
-    // entries 结构随 loader 版本变化——宽松扫描包名即可
-    hotReloadInstalled = JSON.stringify(entries).includes('dsh-hot-reload')
+    // 深度优先扫描字符串字段（JSON.stringify 遇循环引用会抛错，不能用于 entries）
+    const seen = new Set()
+    const scan = (node) => {
+      if (hotReloadInstalled || node === null || typeof node !== 'object') return
+      if (seen.has(node)) return
+      seen.add(node)
+      for (const v of Object.values(node)) {
+        if (typeof v === 'string') {
+          if (v.includes('dsh-hot-reload')) { hotReloadInstalled = true; return }
+        } else if (v !== null && typeof v === 'object') {
+          scan(v)
+        }
+      }
+    }
+    scan(entries)
   } catch {}
   const classify = (p) => classifyPath(p, hotReloadInstalled)
 
