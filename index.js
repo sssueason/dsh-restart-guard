@@ -83,7 +83,8 @@ function apply(ctx, config) {
   try {
     const loader = ctx.get('loader')
     const entries = loader && typeof loader.entries === 'function' ? loader.entries() : []
-    hotReloadInstalled = entries.some((e) => (e.name || '').includes('dsh-hot-reload') || (e.id || '') === 'hot-reload')
+    // entries 结构随 loader 版本变化——宽松扫描包名即可
+    hotReloadInstalled = JSON.stringify(entries).includes('dsh-hot-reload')
   } catch {}
   const classify = (p) => classifyPath(p, hotReloadInstalled)
 
