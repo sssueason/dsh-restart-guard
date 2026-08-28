@@ -61,10 +61,10 @@ function classifyPath(p) {
   return { restart: false, kind: 'unknown', hint: '无法判定的改动类型' }
 }
 
-function apply(ctx) {
+function apply(ctx, config) {
   const cfg = { ...DEFAULTS }
   // 允许从 entry 配置覆盖（cordis.yml 的 config 段）
-  const configured = ctx.config
+  const configured = config
   if (configured && typeof configured === 'object') {
     for (const key of Object.keys(DEFAULTS)) {
       if (configured[key] !== undefined) cfg[key] = configured[key]
@@ -168,8 +168,16 @@ function apply(ctx) {
     return id
   }
   const cancel = (id) => {
-    if (id !== undefined && pending.delete(id)) return true
-    if (id === undefined && state === 'waiting-merge') {
+    if (id !== undefined) {
+      const removed = pending.delete(id)
+      // 全部取消后复位状态机（否则合并窗口结束仍会触发重启）
+      if (removed && pending.size === 0 && state === 'waiting-merge') {
+        if (mergeTimer) { mergeTimer.stop(); mergeTimer = null }
+        state = 'idle'
+      }
+      return removed
+    }
+    if (state === 'waiting-merge') {
       // 取消整批（合并窗口内）
       pending.clear()
       if (mergeTimer) { mergeTimer.stop(); mergeTimer = null }
