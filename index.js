@@ -221,9 +221,17 @@ function apply(ctx, config) {
   const startIdleWait = () => {
     state = 'waiting-idle'
     idleTimer = ctx.timeout(() => {
-      // 等待超时：不打断活跃会话，取消本次重启、保留登记
+      // 等待超时：不打断活跃会话。登记未取消则 15s 后重新等待（避免饿死——
+      // 连续对话回合会让空闲窗口一直错过，旧版本超时后登记残留永不重试）
       stopIdleWait()
       state = 'idle'
+      if (pending.size > 0) {
+        state = 'waiting-merge'
+        mergeTimer = ctx.timeout(() => {
+          mergeTimer = null
+          startIdleWait()
+        }, 15000)
+      }
     }, cfg.idleWaitMs)
     idlePoll = ctx.setInterval(() => {
       if (state !== 'waiting-idle') { stopIdleWait(); return }
