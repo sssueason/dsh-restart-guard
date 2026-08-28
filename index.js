@@ -124,8 +124,10 @@ export function apply(ctx, config) {
       state = 'idle'
       return
     }
-    // 与 dsh-app.ps1 完全一致的启动链：cmd /c pnpm dsh web（环境、日志文件一致）
-    // 子进程输出重定向到 child.log（fd 重定向，父退出后仍有效）→ 失败原因可查
+    // 与 dsh-app.ps1 相同的启动链：cmd /c pnpm dsh web。
+    // 【重要】不加 `> dsh-web.log 2>&1` 重定向——旧进程的启动 cmd 仍持有
+    // dsh-web.log 的写句柄（Windows 文件锁），新进程再打开会失败退出（code 1）。
+    // 新进程输出直接进 child.log（fd 重定向，父退出后仍有效）→ 完整日志 + 失败可查。
     let child = null
     let spawnError = null
     let logFd = null
@@ -133,7 +135,7 @@ export function apply(ctx, config) {
       logFd = openSync(childLogFile, 'a')
     } catch {}
     try {
-      const cmd = 'pnpm dsh web > dsh-web.log 2>&1'
+      const cmd = 'pnpm dsh web'
       child = spawn('cmd.exe', ['/c', cmd], {
         cwd: process.cwd(),
         detached: true,
