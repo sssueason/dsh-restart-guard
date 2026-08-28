@@ -124,9 +124,12 @@ export function apply(ctx, config) {
       state = 'idle'
       return
     }
-    // 与 dsh-app.ps1 相同的启动链：cmd /c pnpm dsh web。
-    // 【重要】不加 `> dsh-web.log 2>&1` 重定向——旧进程的启动 cmd 仍持有
-    // dsh-web.log 的写句柄（Windows 文件锁），新进程再打开会失败退出（code 1）。
+    // 直接 spawn node（与 dsh-app.ps1 的 pnpm 链等效：pnpm 只是包装，cwd=DeepSeek-Harness，
+    // tsx 从 cwd node_modules 解析）。【原因】cmd /c pnpm 链在 Windows 上会让
+    // pnpm→node 子进程弹出可见的 Node.js 控制台窗口（CREATE_NO_WINDOW 只作用于
+    // 直接子进程）；直接 spawn node.exe + windowsHide:true 从源头消除弹窗。
+    // 不加 `> dsh-web.log 2>&1` 重定向——旧进程的启动 cmd 仍持有 dsh-web.log
+    // 写句柄（Windows 文件锁），新进程再打开会失败退出（code 1）。
     // 新进程输出直接进 child.log（fd 重定向，父退出后仍有效）→ 完整日志 + 失败可查。
     let child = null
     let spawnError = null
@@ -135,8 +138,8 @@ export function apply(ctx, config) {
       logFd = openSync(childLogFile, 'a')
     } catch {}
     try {
-      const cmd = 'pnpm dsh web'
-      child = spawn('cmd.exe', ['/c', cmd], {
+      const args = [...(process.execArgv || []), ...(process.argv || []).slice(1)]
+      child = spawn(process.execPath, args, {
         cwd: process.cwd(),
         detached: true,
         stdio: logFd !== null ? ['ignore', logFd, logFd] : 'ignore',
