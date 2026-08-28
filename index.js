@@ -79,25 +79,36 @@ function apply(ctx, config) {
   }
 
   // ---- 检测 dsh-hot-reload 是否活跃（升级类改动的热重载能力） ----
+  // loader.entries 结构随版本变化且可能不可达——用文件系统检测（DSH_HOME/profiles/*）
   let hotReloadInstalled = false
   try {
-    const loader = ctx.get('loader')
-    const entries = loader && typeof loader.entries === 'function' ? loader.entries() : []
-    // 深度优先扫描字符串字段（JSON.stringify 遇循环引用会抛错，不能用于 entries）
-    const seen = new Set()
-    const scan = (node) => {
-      if (hotReloadInstalled || node === null || typeof node !== 'object') return
-      if (seen.has(node)) return
-      seen.add(node)
-      for (const v of Object.values(node)) {
-        if (typeof v === 'string') {
-          if (v.includes('dsh-hot-reload')) { hotReloadInstalled = true; return }
-        } else if (v !== null && typeof v === 'object') {
-          scan(v)
+    const fs = require('node:fs')
+    const path = require('node:path')
+    const os = require('node:os')
+    const home = process.env.DSH_HOME || path.join(os.homedir(), '.dsh')
+    const profilesDir = path.join(home, 'profiles')
+    if (fs.existsSync(profilesDir)) {
+      // 优先当前 profile（argv 中的 positional 参数，如 `dsh web` 的 web）
+      const argv = process.argv || []
+      let profileName = null
+      for (const a of argv.slice(2)) {
+        if (!a.startsWith('-') && !a.includes('=')) { profileName = a; break }
+      }
+      const direct = profileName
+        ? path.join(profilesDir, profileName, 'node_modules', 'dsh-hot-reload', 'package.json')
+        : null
+      if (direct !== null && fs.existsSync(direct)) {
+        hotReloadInstalled = true
+      } else {
+        // 兜底：扫描全部 profile
+        for (const dir of fs.readdirSync(profilesDir)) {
+          if (fs.existsSync(path.join(profilesDir, dir, 'node_modules', 'dsh-hot-reload', 'package.json'))) {
+            hotReloadInstalled = true
+            break
+          }
         }
       }
     }
-    scan(entries)
   } catch {}
   const classify = (p) => classifyPath(p, hotReloadInstalled)
 
