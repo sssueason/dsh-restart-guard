@@ -1,7 +1,24 @@
-# dsh-restart-guard bundle patch —— 重启守卫（常开）。
-# 非必要不重启：合并窗口聚批待重启原因，会话空闲后自动重启；
-# /restart/status|request|cancel|now|classify HTTP API 供 UI/工具编排。
+# dsh-restart-guard bundle patch —— DSH 重启管理（常开，整合 dsh-hot-reload）。
+# 插件升级自动热重载（watch pnpm-lock.yaml）；热重载失败与新增/移除插件、host 代码、
+# 组成文件等残余重启由守卫聚批+空闲自动执行（复刻 dsh-app.ps1 启动链）。
+# inject 仅 timer——无 webServer 的 profile（tui/CLI）不挂起，webServer 路由自动探测。
 - insert:
     - id: restart-guard
       name: 'dsh-restart-guard'
-      inject: [timer, webServer]
+      inject: [timer]
+      # config:
+      #   # 合并窗口（ms）：待重启请求聚批时长
+      #   mergeWindowMs: 60000
+      #   # force 请求的合并窗口（ms）
+      #   forceMergeMs: 5000
+      #   # 最长等待空闲（ms），超时后 15s 重试（force 无超时）
+      #   idleWaitMs: 300000
+      #   # 空闲轮询间隔（ms）；force 模式用 forcePollMs
+      #   idlePollMs: 3000
+      #   forcePollMs: 1000
+      #   # spawn 新进程后退出本进程的延迟（ms）
+      #   exitDelayMs: 2000
+      #   # 空闲后自动重启；false 仅登记
+      #   autoRestart: true
+      #   # 热重载引擎：lockfile 变更去抖（ms）
+      #   debounce: 300

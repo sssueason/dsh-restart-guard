@@ -1,42 +1,41 @@
-'use strict'
 /**
- * dsh-restart-guard —— DSH 重启守卫（v0.1.0）
+ * dsh-restart-guard —— DSH 重启管理（v1.0，整合 dsh-hot-reload）
  *
- * 目标：非必要不重启，最小化热更新。
+ * 目标：非必要不重启，最小化热更新。重启决策树：
+ *   - client bundle 内容 → 原生热更新（刷新浏览器）
+ *   - cordis.patch.yml → 原生 HMR 热重载
+ *   - 插件包升级（已加载）→ 内置热重载引擎（lib/reload.js，watch pnpm-lock.yaml）
+ *   - 热重载失败 → 自动登记重启（内部闭环）
+ *   - 新增/移除插件、host 代码、cordis.yml → 守卫编排：合并窗口 + 空闲 + 自动重启
  *
- * DSH 现有热更新能力（本插件只处理「真正需要重启」的改动）：
- *   - client bundle 内容（/plugins/<id>/client.js）：实时读文件 + rev 哈希 → 刷新浏览器即生效
- *   - cordis.patch.yml（profile / home）：app-boot 的 HMR watcher 事务性热重载
- *   - 动态插件（cordis_define / run / update / rollback）：进程内热插拔
- *   - credentials / llm 动态配置：每次操作重新解析
- * 需要进程重启的：
- *   - 新增 / 移除插件包（loader 元数据缓存，never expire）
- *   - host entry 代码改动（boot 加载 + Node 模块缓存）
- *   - 组成文件（cordis.yml）改动
- *
- * 本插件行为：
- *   1. request(reason) —— 其他插件/工具/HTTP 登记「待重启」原因；
- *   2. 合并窗口（mergeWindowMs，默认 60s）：窗口内多次请求聚批为一次重启；
- *   3. 空闲等待（idleWaitMs，默认 5min）：无 running agent 时执行重启；
- *      超时自动取消本次重启并保留登记（绝不打断活跃会话）；
- *   4. 自动重启：以相同 argv 派生新进程（detached）后退出本进程；
- *   5. classify(path) —— 改动分类判断：哪些热更新、哪些必须重启；
- *   6. /restart/* HTTP API。
+ * 关键设计：
+ *   - inject 仅 timer（webServer 用 ctx.inject/探测——模块级 inject webServer 会在
+ *     无 webServer 的 profile 永久挂起）
+ *   - 自动重启复刻 dsh-app.ps1 启动链（cmd /c pnpm dsh web）——与手动启动完全一致
+ *   - force 模式：回合结束后 1s 轮询立即重启（不等长空闲）
+ *   - spawn 失败/新进程退出 → 旧进程保持运行（不自杀）+ child.log 诊断
  */
+import { readFileSync, existsSync, mkdirSync, writeFileSync, openSync } from 'node:fs'
+import { join, dirname } from 'node:path'
+import { homedir } from 'node:os'
+import { spawn } from 'node:child_process'
+import { createReloader } from './lib/reload.js'
 
-const name = 'dsh-restart-guard'
-const inject = ['timer', 'webServer']
+export const name = 'dsh-restart-guard'
+export const inject = ['timer']
 
 const DEFAULTS = {
   mergeWindowMs: 60000, // 合并窗口：待重启请求聚批时长
+  forceMergeMs: 5000, // force 请求的合并窗口（短）
   idleWaitMs: 300000, // 最长等待空闲时间（超时取消，不强制）
   idlePollMs: 3000, // 空闲轮询间隔
-  exitDelayMs: 1500, // spawn 新进程后退出本进程的延迟（端口释放）
+  forcePollMs: 1000, // force 模式轮询间隔
+  exitDelayMs: 2000, // spawn 新进程后退出本进程的延迟（端口释放）
   autoRestart: true, // 空闲后自动重启；false 时仅登记并提示
 }
 
 // ---- 改动分类表（非必要不重启） ----
-function classifyPath(p, hotReloadInstalled = false) {
+function classifyPath(p, engineActive) {
   const path = String(p || '').replace(/\\/g, '/')
   const lower = path.toLowerCase()
   const base = lower.split('/').pop() || ''
@@ -53,10 +52,9 @@ function classifyPath(p, hotReloadInstalled = false) {
     return {
       restart: true,
       kind: 'plugin-set',
-      // 若已装 dsh-hot-reload：已加载包的「升级」可热重载；新增/移除仍需重启
-      hint: hotReloadInstalled
-        ? '插件升级可被 dsh-hot-reload 热重载；新增/移除插件包仍需要重启'
-        : '插件集合变更由 loader 元数据缓存管理——需要重启（安装 dsh-hot-reload 可使升级免重启）',
+      hint: engineActive
+        ? '已加载插件的「升级」由内置热重载引擎自动处理（失败自动登记重启）；新增/移除插件包仍需要重启'
+        : '插件集合变更由 loader 元数据缓存管理——需要重启',
     }
   }
   if (base === 'cordis.yml' || lower.endsWith('cordis.yml')) {
@@ -68,51 +66,16 @@ function classifyPath(p, hotReloadInstalled = false) {
   return { restart: false, kind: 'unknown', hint: '无法判定的改动类型' }
 }
 
-function apply(ctx, config) {
+export function apply(ctx, config) {
   const cfg = { ...DEFAULTS }
-  // 允许从 entry 配置覆盖（cordis.yml 的 config 段）
-  const configured = config
-  if (configured && typeof configured === 'object') {
+  if (config && typeof config === 'object') {
     for (const key of Object.keys(DEFAULTS)) {
-      if (configured[key] !== undefined) cfg[key] = configured[key]
+      if (config[key] !== undefined) cfg[key] = config[key]
     }
   }
 
-  // ---- 检测 dsh-hot-reload 是否活跃（升级类改动的热重载能力） ----
-  // loader.entries 结构随版本变化且可能不可达——用文件系统检测（DSH_HOME/profiles/*）
-  let hotReloadInstalled = false
-  try {
-    const fs = require('node:fs')
-    const path = require('node:path')
-    const os = require('node:os')
-    const home = process.env.DSH_HOME || path.join(os.homedir(), '.dsh')
-    const profilesDir = path.join(home, 'profiles')
-    if (fs.existsSync(profilesDir)) {
-      // 优先当前 profile（argv 中的 positional 参数，如 `dsh web` 的 web）
-      const argv = process.argv || []
-      let profileName = null
-      for (const a of argv.slice(2)) {
-        if (!a.startsWith('-') && !a.includes('=')) { profileName = a; break }
-      }
-      const direct = profileName
-        ? path.join(profilesDir, profileName, 'node_modules', 'dsh-hot-reload', 'package.json')
-        : null
-      if (direct !== null && fs.existsSync(direct)) {
-        hotReloadInstalled = true
-      } else {
-        // 兜底：扫描全部 profile
-        for (const dir of fs.readdirSync(profilesDir)) {
-          if (fs.existsSync(path.join(profilesDir, dir, 'node_modules', 'dsh-hot-reload', 'package.json'))) {
-            hotReloadInstalled = true
-            break
-          }
-        }
-      }
-    }
-  } catch {}
-  const classify = (p) => classifyPath(p, hotReloadInstalled)
-
-  /** id -> { reason, kind, requester, createdAt } */
+  // ---- 状态 ----
+  /** id -> { reason, kind, requester, createdAt, force } */
   const pending = new Map()
   /** { at, reasons[] } */
   const history = []
@@ -121,7 +84,6 @@ function apply(ctx, config) {
   let mergeTimer = null
   let idleTimer = null
   let idlePoll = null
-  let lastActivity = 0
 
   // ---- 空闲检测（agents 服务：status idle|running） ----
   const isIdle = () => {
@@ -134,22 +96,18 @@ function apply(ctx, config) {
     }
   }
 
-  // ---- 重启执行 ----
-  // 关键：spawn 失败（含异步 error 事件）时【不退出本进程】——旧版本会 exit(1) 自杀，
-  // 导致 web 挂掉、用户被迫手动重启。失败时复位状态并保留登记。
-  const fs = require('node:fs')
-  const path = require('node:path')
-  const os = require('node:os')
-  const stateFile = path.join(
-    process.env.DSH_HOME || path.join(os.homedir(), '.dsh'),
-    'dsh-restart-guard-state.json',
-  )
+  // ---- 状态文件（重启证据 + 诊断） ----
+  const dshHome = process.env.DSH_HOME || join(homedir(), '.dsh')
+  const stateFile = join(dshHome, 'dsh-restart-guard-state.json')
+  const childLogFile = join(dshHome, 'dsh-restart-guard-state.child.log')
   const writeState = (obj) => {
     try {
-      fs.mkdirSync(path.dirname(stateFile), { recursive: true })
-      fs.writeFileSync(stateFile, JSON.stringify(obj, null, 2))
+      mkdirSync(dirname(stateFile), { recursive: true })
+      writeFileSync(stateFile, JSON.stringify(obj, null, 2))
     } catch {}
   }
+
+  // ---- 重启执行（复刻 dsh-app.ps1 启动链） ----
   const executeRestart = () => {
     if (state === 'restarting') return
     state = 'restarting'
@@ -160,36 +118,32 @@ function apply(ctx, config) {
     pending.clear()
     history.push({ at: Date.now(), reasons })
     if (history.length > 50) history.shift()
-    // 重启证据持久化：新进程（或用户手动重启后）可查上次自动重启是否执行
     writeState({ last: { at: Date.now(), reasons, via: 'auto', stage: 'spawning' } })
     if (!cfg.autoRestart) {
       state = 'idle'
       return
     }
-    // 以相同启动参数派生新进程（execArgv 保留 tsx 等 loader 参数）。
-    // 子进程输出重定向到 .child.log 文件（fd 重定向：父进程退出后 fd 仍有效），
-    // 新进程启动失败/崩溃的原因可以事后读取。
-    const args = [...(process.execArgv || []), ...(process.argv || []).slice(1)]
+    // 与 dsh-app.ps1 完全一致的启动链：cmd /c pnpm dsh web（环境、日志文件一致）
+    // 子进程输出重定向到 child.log（fd 重定向，父退出后仍有效）→ 失败原因可查
     let child = null
     let spawnError = null
     let logFd = null
     try {
-      logFd = fs.openSync(stateFile.replace(/\.json$/, '.child.log'), 'a')
+      logFd = openSync(childLogFile, 'a')
     } catch {}
     try {
-      const { spawn } = require('node:child_process')
-      child = spawn(process.execPath, args, {
+      const cmd = 'pnpm dsh web > dsh-web.log 2>&1'
+      child = spawn('cmd.exe', ['/c', cmd], {
         cwd: process.cwd(),
         detached: true,
         stdio: logFd !== null ? ['ignore', logFd, logFd] : 'ignore',
-        windowsHide: false,
+        windowsHide: true,
       })
       child.on('error', (err) => {
         spawnError = String(err)
         writeState({ last: { at: Date.now(), reasons, via: 'auto', stage: 'spawn-error', spawnError } })
       })
       child.on('exit', (code, sig) => {
-        // 新进程退出了（很可能启动失败）——记录，且本进程保持运行
         writeState({ last: { at: Date.now(), reasons, via: 'auto', stage: 'child-exited', code, sig } })
       })
       child.unref()
@@ -201,7 +155,7 @@ function apply(ctx, config) {
       state = 'idle'
       return
     }
-    // 给新进程窗口；新进程已退出或 spawn 失败则保持运行（不自杀），复位状态
+    // 新进程存活才退出本进程；spawn 失败/新进程已退出则保持运行（不自杀）
     ctx.timeout(() => {
       if (spawnError !== null || child.exitCode !== null || child.signalCode !== null) {
         state = 'idle'
@@ -214,54 +168,57 @@ function apply(ctx, config) {
   }
 
   // ---- 状态机 ----
+  const hasForce = () => [...pending.values()].some((p) => p.force === true)
   const stopIdleWait = () => {
     if (idleTimer) { idleTimer.stop(); idleTimer = null }
     if (idlePoll) { idlePoll.stop(); idlePoll = null }
   }
   const startIdleWait = () => {
     state = 'waiting-idle'
-    idleTimer = ctx.timeout(() => {
-      // 等待超时：不打断活跃会话。登记未取消则 15s 后重新等待（避免饿死——
-      // 连续对话回合会让空闲窗口一直错过，旧版本超时后登记残留永不重试）
-      stopIdleWait()
-      state = 'idle'
-      if (pending.size > 0) {
-        state = 'waiting-merge'
-        mergeTimer = ctx.timeout(() => {
-          mergeTimer = null
-          startIdleWait()
-        }, 15000)
-      }
-    }, cfg.idleWaitMs)
+    const force = hasForce()
+    // force：不设超时（直到成功或取消）；非 force：超时后 15s 重试（防饿死）
+    if (!force) {
+      idleTimer = ctx.timeout(() => {
+        stopIdleWait()
+        state = 'idle'
+        if (pending.size > 0) {
+          state = 'waiting-merge'
+          mergeTimer = ctx.timeout(() => {
+            mergeTimer = null
+            startIdleWait()
+          }, 15000)
+        }
+      }, cfg.idleWaitMs)
+    }
     idlePoll = ctx.setInterval(() => {
       if (state !== 'waiting-idle') { stopIdleWait(); return }
       if (isIdle()) executeRestart()
-    }, cfg.idlePollMs)
+    }, force ? cfg.forcePollMs : cfg.idlePollMs)
     if (isIdle()) executeRestart()
   }
   const request = (reason, opts) => {
     const r = String(reason || '未说明原因')
     const id = `rg-${Date.now()}-${Math.floor(Math.random() * 1e6)}`
+    const force = opts?.force === true
     pending.set(id, {
       reason: r,
       kind: opts?.kind || 'manual',
       requester: opts?.requester || 'unknown',
       createdAt: Date.now(),
+      force,
     })
-    lastActivity = Date.now()
     if (state === 'idle') {
       state = 'waiting-merge'
       mergeTimer = ctx.timeout(() => {
         mergeTimer = null
         startIdleWait()
-      }, cfg.mergeWindowMs)
+      }, force ? cfg.forceMergeMs : cfg.mergeWindowMs)
     }
     return id
   }
   const cancel = (id) => {
     if (id !== undefined) {
       const removed = pending.delete(id)
-      // 全部取消后复位状态机（否则合并窗口结束仍会触发重启）
       if (removed && pending.size === 0 && state === 'waiting-merge') {
         if (mergeTimer) { mergeTimer.stop(); mergeTimer = null }
         state = 'idle'
@@ -269,13 +226,12 @@ function apply(ctx, config) {
       return removed
     }
     if (state === 'waiting-merge') {
-      // 取消整批（合并窗口内）
       pending.clear()
       if (mergeTimer) { mergeTimer.stop(); mergeTimer = null }
       state = 'idle'
       return true
     }
-    if (id === undefined && state === 'waiting-idle') {
+    if (state === 'waiting-idle') {
       stopIdleWait()
       pending.clear()
       state = 'idle'
@@ -286,38 +242,46 @@ function apply(ctx, config) {
   const status = () => {
     let lastRestart = null
     try {
-      lastRestart = JSON.parse(fs.readFileSync(stateFile, 'utf8')).last ?? null
+      lastRestart = JSON.parse(readFileSync(stateFile, 'utf8')).last ?? null
     } catch {}
+    const engine = reloader !== null ? reloader.status() : { active: false }
     return {
       state,
       pending: [...pending.entries()].map(([id, p]) => ({ id, ...p })),
       history: history.slice(-10),
       lastRestart,
       config: { ...cfg },
-      hotReloadInstalled,
+      reloadEngine: { active: reloader !== null, ...engine },
       hotUpdateHints: {
         clientBundle: '改 client 代码 → 刷新浏览器即生效',
         profilePatch: '改 cordis.patch.yml → HMR 热重载',
         dynamicPlugin: '实验性 host 代码 → 用动态插件避免重启',
-        pluginUpgrade: hotReloadInstalled ? '已装 dsh-hot-reload → 插件升级自动热重载' : '插件升级需重启（安装 dsh-hot-reload 可免）',
+        pluginUpgrade: reloader !== null ? '插件升级由内置热重载引擎自动处理；失败自动登记重启' : '插件升级需重启',
       },
     }
   }
   const restartNow = (reason) => {
-    request(reason || 'manual restartNow', { kind: 'forced' })
-    // 强制：跳过合并与空闲等待
+    request(reason || 'manual restartNow', { kind: 'forced', force: true })
     if (mergeTimer) { mergeTimer.stop(); mergeTimer = null }
     startIdleWait()
-    // 立即重启（不等空闲轮询）
     stopIdleWait()
     executeRestart()
     return true
   }
 
+  // ---- 热重载引擎（整合 dsh-hot-reload） ----
+  // 引擎失败（TERMINAL）→ 自动登记重启（内部闭环）
+  const reloader = createReloader(ctx, config, {
+    onRestartNeeded: (pkg, version) => {
+      request(`热重载失败 ${pkg}@${version}，需要重启`, { kind: 'reload-failed' })
+    },
+  })
+  const classify = (p) => classifyPath(p, reloader !== null)
+
   // ---- service ----
   ctx.provide('restartGuard', { request, cancel, status, classify, restartNow })
 
-  // ---- HTTP routes（webServer 可选） ----
+  // ---- HTTP routes（webServer 可选：ctx.get + 探测；无 webServer 的 profile 不挂起） ----
   const readBody = (req) => new Promise((resolve) => {
     const chunks = []
     req.on('data', (c) => chunks.push(c))
@@ -343,7 +307,10 @@ function apply(ctx, config) {
       kind: 'exact', path: '/restart/request',
       handler: async (req, res) => {
         const body = await readBody(req)
-        sendJson(res, 200, { ok: true, id: request(body?.reason, { kind: body?.kind, requester: 'http' }) })
+        sendJson(res, 200, {
+          ok: true,
+          id: request(body?.reason, { kind: body?.kind, requester: 'http', force: body?.force === true }),
+        })
       },
     }))
     ctx.effect(() => ws.register({
@@ -386,5 +353,3 @@ function apply(ctx, config) {
     }, 2000)
   }
 }
-
-module.exports = { apply, inject, name }
